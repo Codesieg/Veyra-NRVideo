@@ -75,6 +75,8 @@ std::wstring fileStamp(){
     swprintf_s(buffer,L"%04d-%02d-%02d-%02d%02d%02d",local.tm_year+1900,local.tm_mon+1,local.tm_mday,local.tm_hour,local.tm_min,local.tm_sec);
     return buffer;
 }
+// Largest even value not above the side: 4:2:0 encoders need even sides.
+constexpr uint32_t evenExtent(uint32_t side){return side&~1u;}
 // About 0.15 bit per pixel for H.264 at the recorded rate; HEVC needs ~2/3 of it.
 uint32_t autoBitrateMbps(uint32_t width,uint32_t height,uint32_t fps,bool hevc){
     const double mbps=double(width)*height*fps*0.15*(hevc?0.65:1.0)/1e6;
@@ -534,7 +536,7 @@ struct LiveRecorder::Segment final : sink::RecordingAudioSink, MicrophoneSink {
         if(pending<0)closeJobs();
     }
     bool matches(const PresentCapture::Frame& frame) const {
-        return frame.width==width&&frame.height==height&&frame.hdrMode==hdrMode;
+        return evenExtent(frame.width)==width&&evenExtent(frame.height)==height&&frame.hdrMode==hdrMode;
     }
 
     // ---- creation (engine thread) -------------------------------------------
@@ -1250,14 +1252,20 @@ bool LiveRecorder::record(ID3D12GraphicsCommandList* list,const Frame& frame){
         segment->vendor=adapterVendor(segment->device.Get());
         segment->nvenc=segment->vendor==0x10DE&&GetEnvironmentVariableW(L"VEYRA_TEST_FORCE_MF_ENCODER",nullptr,0)==0;
         if(frame.hdrMode&&!segment->nvenc)return fail(L"HDR 画面录制需要 NVIDIA 显卡（HEVC 10bit）；请关闭 HDR 输出后再录制");
-        if(frame.width<16||frame.height<16||(frame.width&1)||(frame.height&1))
+        // Encoders need even sides (4:2:0 chroma). An odd window size (e.g. a
+        // captured window of 2612x1379) is recorded with its last column/row
+        // dropped instead of refusing: RgbToNv12 only reads inside the extent.
+        if(frame.width<16||frame.height<16)
             return fail(std::format(L"当前画面尺寸 {}×{} 无法录制",frame.width,frame.height));
-        segment->width=frame.width;segment->height=frame.height;segment->hdrMode=frame.hdrMode;
+        segment->width=evenExtent(frame.width);segment->height=evenExtent(frame.height);segment->hdrMode=frame.hdrMode;
+        if(segment->width!=frame.width||segment->height!=frame.height)
+            veyra::log::info("live-recorder",std::format("odd picture {}x{} recorded as {}x{} (last column/row dropped)",
+                frame.width,frame.height,segment->width,segment->height));
         // H.264 hardware encoders stop at 4096 pixels per side.
-        segment->hevc=s.settings.hevc||frame.hdrMode!=0||frame.width>4096||frame.height>4096;
+        segment->hevc=s.settings.hevc||frame.hdrMode!=0||segment->width>4096||segment->height>4096;
         const double hint=s.presentFps.load();
         segment->fps=s.settings.fpsLimit?s.settings.fpsLimit:uint32_t(std::clamp<long>(std::lround(hint>1?hint:60.0),10,480));
-        segment->bitrateMbps=s.settings.bitrateMbps?s.settings.bitrateMbps:autoBitrateMbps(frame.width,frame.height,segment->fps,segment->hevc);
+        segment->bitrateMbps=s.settings.bitrateMbps?s.settings.bitrateMbps:autoBitrateMbps(segment->width,segment->height,segment->fps,segment->hevc);
         segment->sound=s.settings.audio;
         segment->microphone=s.settings.microphone;
         segment->microphoneTrack=s.settings.microphoneTrack;
